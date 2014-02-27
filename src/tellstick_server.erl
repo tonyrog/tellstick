@@ -81,10 +81,10 @@
 
 -record(ctx, 
 	{
-	  uart,           %% serial port descriptor
-	  device,         %% device string
-	  variant,        %% stick/duo/net | v1|v2|v3|simulated
-	  version,        %% tellstick(duo) version
+	  handle,         %% serial port / net socket / undefined
+	  device,         %% device string (for net = code )
+	  variant,        %% stick/duo/net  stick|duo|net|simulated
+	  version,        %% first version if detected
 	  command,        %% last command
 	  client,         %% last client
 	  queue,          %% request queue
@@ -108,7 +108,8 @@
 -define(US_TO_ASCII(U), ((U) div 10)).
 
 %% For dialyzer
--type start_options()::{device, {Device::string() | simulated, v1 | v2}} |
+-type start_options()::{device, Device::string()} |
+		       {variant, stick|duo|net|simulated} |
 		       {retry_timeout, TimeOut::timeout()}.
 
 
@@ -193,7 +194,7 @@ unsubscribe(Ref) ->
 	   []) -> 
 		  ok | {error, Error::term()}.
 
-nexa(House,Channel,On,[]) when
+nexa(House,Channel,On,_Flags) when
       House >= $A, House =< $P,
       Channel >= 1, Channel =< 16, (is_boolean(On) orelse On=:=bell) ->
     gen_server:call(?SERVER, {nexa,House,Channel,On}, 9000).
@@ -232,10 +233,10 @@ nexax(Serial,Channel,Level,_Flags) when
 -spec waveman(House::integer(), 
 	      Channel::integer(), 
 	      On::boolean(),
-	      []) -> 
+	      [{atom(),term()}]) -> 
 		     ok | {error, Error::term()}.
 
-waveman(House,Channel,On,[]) when
+waveman(House,Channel,On,_Flags) when
       House >= $A, House =< $P,
       Channel >= 1, Channel =< 16, is_boolean(On) ->
     gen_server:call(?SERVER, {waveman,House,Channel,On}, 9000).    
@@ -250,10 +251,10 @@ waveman(House,Channel,On,[]) when
 -spec sartano(Dummy::term(),
 	      Channel::integer(), 
 	      On::boolean(),
-	      []) -> 
+	      [{atom(),term()}]) -> 
 		     ok | {error, Error::term()}.
 
-sartano(_Dummy,Channel,On,[]) when
+sartano(_Dummy,Channel,On,_Flags) when
     Channel >= 0, Channel =< 16#3FF, is_boolean(On) ->
     gen_server:call(?SERVER, {sartano,Channel,On}, 9000).
     
@@ -296,10 +297,10 @@ ikea(System,Channel,Level,Flags) when
 -spec risingsun(Code::integer(), 
 		Unit::integer(), 
 		On::boolean(),
-		[]) -> 
+		[{atom(),term()}]) -> 
 		       ok | {error, Error::term()}.
 
-risingsun(Code,Unit,On,[]) when
+risingsun(Code,Unit,On,_Flags) when
       Code >= 1, Code =< 4, Unit >= 1, Unit =< 4, is_boolean(On) ->    
     gen_server:call(?SERVER, {risingsun,Code,Unit,On}, 9000).
 
@@ -337,8 +338,8 @@ send_pulses(PulseData) ->
 
 init(Opts) ->
     lager:info("~p: init: args = ~p,\n pid = ~p", [?MODULE, Opts, self()]),
-    Variant = proplists:get_value(variant, Opts, v1),
-    Device  = proplists:get_value(device, Opts, simulated),
+    Variant = proplists:get_value(variant, Opts, stick),
+    Device  = proplists:get_value(device, Opts, ""),
     Reopen_ival = proplists:get_value(retry_timeout, Opts, infinity),
     S = #ctx { device = Device, 
 	       variant=Variant,
@@ -348,16 +349,47 @@ init(Opts) ->
 	{ok, S1} -> {ok, S1};
 	Error -> {stop, Error}
     end.
-	    
-open(Ctx=#ctx {device = ""}) ->
+
+open(Ctx=#ctx { variant = net, device = Code, reopen_ival = Reopen_ival }) ->
+    case tellstick_net:detect() of
+	{ok,Found} ->
+	    case lists:dropwhile(fun({_,Prop}) ->
+					 not lists:member({code,Code}, Prop)
+				 end, Found) of
+		[] ->
+		    if Reopen_ival =:= infinity ->
+			    Error = {error, enoent},
+			    lager:debug("open: Driver not started, reason = ~p.", [Error]),
+			    Error;
+		       true ->
+			    lager:debug("open: device ~s found, will try again"
+					" in ~p millisecs.", [Code, Reopen_ival]),
+			    Reopen_timer = erlang:start_timer(Reopen_ival,
+							      self(), reopen),
+			    {ok, Ctx#ctx { reopen_timer = Reopen_timer }}
+		    end;
+		[{Address,Prop}|_] ->
+		    case tellstick_net:open(Address) of
+			{ok,TSock} ->
+			    tellstick_net:reglistener(TSock),
+			    Version = proplists:get_value(version,Prop),
+			    {ok, Ctx#ctx { handle=TSock, version=Version }};
+			Error ->
+			    Error
+		    end
+	    end;
+	Error ->
+	    Error
+    end;
+open(Ctx=#ctx { variant = simulated, device = ""}) ->
     lager:debug("TELLSTICK open: simulated\n", []),
-    {ok, Ctx#ctx { uart=simulated, version="0" }};
+    {ok, Ctx#ctx { handle=simulated, version="0" }};
 
 open(Ctx=#ctx {device = DeviceName, variant=Variant,
 	       reopen_ival = Reopen_ival }) ->
     Speed = case Variant of
-		v1 -> 4800; %% Only 4800 possible for tellstick v1 ...
-		v2 -> 9600
+		stick -> 4800; %% Only 4800 possible for tellstick / stick ...
+		duo -> 9600
 	    end,
     Options = [{baud,Speed},{mode,list},{active,true},{packet,line},
 	       {csize,8},{parity,none},{stopb,1}],
@@ -365,30 +397,35 @@ open(Ctx=#ctx {device = DeviceName, variant=Variant,
 	{ok,U} ->
 	    lager:debug("TELLSTICK open: ~s@~w -> ~p", [DeviceName,Speed,U]),
 	    uart:send(U, "V+"), %% answer is picked in handle_info
-	    {ok, Ctx#ctx { uart=U }};
-	{error, E} when E == eaccess;
-			E == enoent ->
-	    if Reopen_ival == infinity ->
-		    lager:debug("open: Driver not started, reason = ~p.\n", [E]),
+	    {ok, Ctx#ctx { handle=U }};
+	{error, E} when E =:= eaccess;
+			E =:= enoent ->
+	    if Reopen_ival =:= infinity ->
+		    lager:debug("open: Driver not started, reason = ~p.", [E]),
 		    {error, E};
 	       true ->
 		    lager:debug("open: uart could not be opened, will try again"
-				" in ~p millisecs.\n", [Reopen_ival]),
+				" in ~p millisecs.", [Reopen_ival]),
 		    Reopen_timer = erlang:start_timer(Reopen_ival,
 						      self(), reopen),
 		    {ok, Ctx#ctx { reopen_timer = Reopen_timer }}
 	    end;
 	    
 	Error ->
-	    lager:debug("open: Driver not started, reason = ~p.\n", 
+	    lager:debug("open: Driver not started, reason = ~p.", 
 		 [Error]),
 	    Error
     end.
 
-close(Ctx=#ctx {uart = U}) when is_port(U) ->
-    lager:debug("TELLSTICK close: ~p", [U]),
+close(Ctx=#ctx {handle = TSock, variant = V}) when V =:= net ->
+    lager:debug("tellstick net close: ~p", [V]),
+    tellstick_net:close(TSock),
+    {ok, Ctx#ctx { handle = undefined }};
+close(Ctx=#ctx {handle = U, variant = V})
+  when is_port(U), ((V =:= stick) orelse ((V =:= duo))) ->
+    lager:debug("tellstick ~w close: ~p", [U,V]),
     uart:close(U),
-    {ok, Ctx#ctx { uart=undefined }};
+    {ok, Ctx#ctx { handle=undefined }};
 close(Ctx) ->
     {ok, Ctx}.
 
@@ -424,7 +461,7 @@ handle_call({unsubscribe,Ref},_From,Ctx) ->
     {reply, ok, Ctx1};
     
 handle_call(version, _From, Ctx) ->
-    if Ctx#ctx.uart =:= undefined ->
+    if Ctx#ctx.handle =:= undefined ->
 	    {reply, {error,no_port}, Ctx};
        true ->
 	    {reply, Ctx#ctx.version, Ctx}
@@ -471,8 +508,12 @@ command(F, Args, Ctx=#ctx { client = _Client}) ->
 	    {reply, {error,Reason}, Ctx}
     end.
 
-command_pulse_data(PulseData, Ctx=#ctx { uart=U }) when U =/= undefined ->
-    case send_pulses_(U, PulseData) of
+command_pulse_data(PulseData, Ctx=#ctx { handle=Handle, variant=Variant }) 
+  when Handle =/= undefined ->
+    case send_pulses_(Handle, Variant, PulseData) of
+	ok -> %% no wait needed from net! just space commands a bit
+	    TRef = erlang:start_timer(500, self(), reply),
+	    {noreply,Ctx#ctx {command = net, reply_timer = TRef}};
 	{ok,Command1} ->
 	    lager:debug("command: sent ~p, client ~p", 
 			[Command1,Ctx#ctx.client]),
@@ -480,7 +521,7 @@ command_pulse_data(PulseData, Ctx=#ctx { uart=U }) when U =/= undefined ->
 	    TRef = erlang:start_timer(3000, self(), reply),
 	    {noreply,Ctx#ctx {command = Command1, reply_timer = TRef}};
 	{simulated, ok} ->
-	    {reply, ok, Ctx};
+	    {reply, ok, Ctx#ctx { client = undefined}};
 	Other ->
 	    lager:debug("command: send failed, reason ~p", [Other]),
 	    {reply, Other, Ctx}
@@ -501,20 +542,28 @@ command_pulse_data(_PulseData, Ctx) ->
 			 {noreply, Ctx::#ctx{}} |
 			 {stop, Reason::term(), Ctx::#ctx{}}.
 
-handle_cast({setopt, {Option, Value}}, Ctx=#ctx { uart = U}) ->
+handle_cast({setopt, {Option, Value}}, Ctx=#ctx { handle = U}) ->
     lager:debug("handle_cast: setopt ~p = ~p", [Option, Value]),
-    uart:setopt(U, Option, Value),
+    if Ctx#ctx.variant =:= stick; Ctx#ctx.variant =:= duo ->
+	    uart:setopt(U, Option, Value);
+       true ->
+	    ok
+    end,
     {noreply, Ctx};
-handle_cast(Cast, Ctx=#ctx {uart = U, client=Client})
+handle_cast(Cast, Ctx=#ctx { handle = U, client=Client})
   when U =/= undefined, Client =/= undefined ->
     lager:debug("handle_cast: Driver busy, store cast ~p", [Cast]),
     Q = queue:in({cast,Cast}, Ctx#ctx.queue),
     {noreply, Ctx#ctx { queue = Q }};
-handle_cast({command, Command}, Ctx=#ctx {uart = U}) ->
-    lager:debug("handle_cast: command ~p", [Command]),
-    _Reply = uart:send(U, Command),
-    lager:debug("handle_cast: command reply ~p", [_Reply]),
-    {noreply, Ctx};
+handle_cast({command, Command}, Ctx=#ctx { handle = Handle}) ->
+    if Ctx#ctx.variant =:= stick; Ctx#ctx.variant =:= duo ->
+	    lager:debug("handle_cast: command ~p", [Command]),
+	    _Reply = uart:send(Handle, Command),
+	    lager:debug("handle_cast: command reply ~p", [_Reply]),
+	    {noreply, Ctx};
+       true ->
+	    {noreply, Ctx}
+    end;
 handle_cast(_Msg, Ctx) ->
     lager:debug("handle_cast: Unknown message ~p", [_Msg]),
     {noreply, Ctx}.
@@ -538,14 +587,8 @@ handle_cast(_Msg, Ctx) ->
 			 {noreply, Ctx::#ctx{}} |
 			 {stop, Reason::term(), Ctx::#ctx{}}.
 
-handle_info({timeout,TRef,reply}, 
-	    Ctx=#ctx {client=Client, reply_timer=TRef}) ->
-    lager:debug("handle_info: timeout waiting for port", []),
-    gen_server:reply(Client, {error, port_timeout}),
-    Ctx1 = Ctx#ctx { reply_timer=undefined, client = undefined},
-    next_command(Ctx1);
 
-handle_info({uart,U,Data},  Ctx) when U =:= Ctx#ctx.uart ->
+handle_info({uart,U,Data},  Ctx) when U =:= Ctx#ctx.handle ->
     lager:debug("handle_info: port data ~p", [Data]),
     case trim(Data) of
 	[$+,CmdChar|_CmdReply] when Ctx#ctx.client =/= undefined, 
@@ -564,7 +607,7 @@ handle_info({uart,U,Data},  Ctx) when U =:= Ctx#ctx.uart ->
 	    lager:debug("handle_info: reply ~p", [Data]),
 	    {noreply, Ctx}
     end;
-handle_info({uart_error,U,Reason}, Ctx) when U =:= Ctx#ctx.uart ->
+handle_info({uart_error,U,Reason}, Ctx) when U =:= Ctx#ctx.handle ->
     if Reason =:= enxio ->
 	    lager:error("uart error ~p device ~s unplugged?", 
 			[Reason,Ctx#ctx.device]);
@@ -573,16 +616,49 @@ handle_info({uart_error,U,Reason}, Ctx) when U =:= Ctx#ctx.uart ->
 			[Reason,Ctx#ctx.device])
     end,
     {noreply, Ctx};
-handle_info({uart_closed,U}, Ctx) when U =:= Ctx#ctx.uart ->
+handle_info({uart_closed,U}, Ctx) when U =:= Ctx#ctx.handle ->
     uart:close(U),
     lager:error("uart close device ~s will retry", [Ctx#ctx.device]),
-    case open(Ctx#ctx { uart=undefined}) of
+    case open(Ctx#ctx { handle=undefined}) of
 	{ok, Ctx1} -> {noreply, Ctx1};
 	Error -> {stop, Error, Ctx}
     end;
 
+handle_info({udp, _Socket,_IP,_Port,Data}, Ctx) when Ctx#ctx.variant =:= net ->
+    %% match client port ?
+    try tellstick_net:decode_sequence(Data) of
+	Event ->
+	    lager:debug("decoded event as ~p", [Event]),
+	    case Event of
+		["RawData", {struct,EventData}] ->
+		    send_event(Ctx#ctx.subs, EventData);
+		["Data", {struct,EventData}] ->
+		    send_event(Ctx#ctx.subs, EventData);
+		_Other ->
+		    ok
+	    end,
+	    {noreply, Ctx}
+    catch
+	error:Reason ->
+	    lager:warning("decoding of ~p failed: ~p",
+			  [Data, Reason]),
+	    {noreply, Ctx}
+    end;
+
+handle_info({timeout,TRef,reply}, Ctx=#ctx {variant=net, reply_timer=TRef}) ->
+    %% for tellstick net this just space sending a bit
+    gen_server:reply(Ctx#ctx.client, ok),
+    Ctx1 = Ctx#ctx { reply_timer=undefined, client = undefined},
+    next_command(Ctx1);
+handle_info({timeout,TRef,reply}, Ctx=#ctx {reply_timer=TRef}) ->
+    lager:debug("handle_info: timeout waiting for port", []),
+    gen_server:reply(Ctx#ctx.client, {error, port_timeout}),
+    Ctx1 = Ctx#ctx { reply_timer=undefined, client = undefined},
+    next_command(Ctx1);
+
+
 handle_info({timeout,Ref,reopen}, Ctx) when Ctx#ctx.reopen_timer =:= Ref ->
-    case open(Ctx#ctx { uart=undefined, reopen_timer=undefined}) of
+    case open(Ctx#ctx { handle=undefined, reopen_timer=undefined}) of
 	{ok, Ctx1} -> {noreply, Ctx1};
 	Error -> {stop, Error, Ctx}
     end;
@@ -839,7 +915,7 @@ ikea_command(System, Channel, DimLevel, DimStyle) when
       System >= 1, System =< 16 andalso
       Channel >= 1, Channel =< 10 andalso
       DimLevel >= 0, DimLevel =< 10 andalso
-      (DimStyle == 0 orelse DimStyle == 1) ->
+      (DimStyle =:= 0 orelse DimStyle =:= 1) ->
     ChannelCode = Channel rem 10,
     IntCode0 = (1 bsl (ChannelCode+4)) bor reverse_bits(System-1,4),
     IntFade = (DimStyle*2 + 1) bsl 4,   %% 1 or 3 bsl 4
@@ -930,10 +1006,13 @@ reverse_bits_(Bits, I, RBits) ->
     reverse_bits_(Bits bsr 1, I-1, (RBits bsl 1) bor (Bits band 1)).
 
 
-send_pulses_(simulated, _Data) ->
+send_pulses_(_, simulated, _Data) ->
     lager:debug("send_command: Sending data =~p\n", [_Data]),
     {simulated, ok};
-send_pulses_(U, Data) ->
+send_pulses_(U, net, Data) ->
+    Data1 = ascii_data(Data),    
+    tellstick_net:send_pulses(U, Data1);
+send_pulses_(U, Variant, Data) when Variant =:= stick; Variant =:= duo ->
     Data1 = ascii_data(Data),
     N = length(Data1),
     Command = 
