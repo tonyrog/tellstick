@@ -459,42 +459,44 @@ handle_call({unsubscribe,Ref},_From,Ctx) ->
     erlang:demonitor(Ref),
     Ctx1 = remove_subscription(Ref,Ctx),
     {reply, ok, Ctx1};
-    
 handle_call(version, _From, Ctx) ->
     if Ctx#ctx.handle =:= undefined ->
 	    {reply, {error,no_port}, Ctx};
        true ->
 	    {reply, Ctx#ctx.version, Ctx}
     end;
-
-handle_call(Call,From,Ctx=#ctx {client = Client}) 
-  when Client =/= undefined andalso Call =/= stop ->
-    %% Driver is busy ..
-    lager:debug("handle_call: Driver busy, store call ~p", [Call]),
-    %% set timer already here? probably!
-    Q = queue:in({call,Call,From}, Ctx#ctx.queue),
-    {noreply, Ctx#ctx { queue = Q }};
-
-handle_call({nexa,House,Channel,On},From,Ctx) ->
-    command(nexa_command,[House, Channel, On], Ctx#ctx {client = From});
-handle_call({nexax,Serial,Channel,Level},From,Ctx) ->
-     command(nexax_command, [Serial, Channel, Level], Ctx#ctx {client = From});
-handle_call({waveman,House,Channel,On},From,Ctx) ->
-    command(waveman_command, [House, Channel, On], Ctx#ctx {client = From});
-handle_call({sartano,Channel,On},From,Ctx) ->
-    command(sartano_command,[Channel, On], Ctx#ctx {client = From});
-handle_call({ikea,System,Channel,Level,Style},From,Ctx) ->
-    command(ikea_command, [System,Channel,Level,Style], Ctx#ctx {client = From});
-handle_call({risingsun,Code,Unit,On},From,Ctx) ->
-    command(risingsun_command, [Code,Unit,On], Ctx#ctx {client = From});
-
-handle_call({send_pulses,PulsData}, From, Ctx) ->
-    command_pulse_data(PulsData, Ctx#ctx { client = From });
-
 handle_call(stop, _From, Ctx) ->
     {stop, normal, ok, Ctx};
+handle_call(Call, From, Ctx) ->
+    if Ctx#ctx.variant =:= net ->
+	    %% FIXME: this delay is here to fix some duplex problems
+	    %% tellstick net can not receive and send at the same time 
+	    %% in a descent way ..?
+	    erlang:start_timer(700, self(), next),
+	    Q = queue:in({call,Call,From}, Ctx#ctx.queue),
+	    {noreply, Ctx#ctx { queue = Q }};
+       Ctx#ctx.client =/= undefined ->
+	    Q = queue:in({call,Call,From}, Ctx#ctx.queue),
+	    {noreply, Ctx#ctx { queue = Q }};
+       true ->
+	    handle_call_(Call, From, Ctx)
+    end.
 
-handle_call(_Request, _From, Ctx) ->
+handle_call_({nexa,House,Channel,On},From,Ctx) ->
+    command(nexa_command,[House, Channel, On], Ctx#ctx {client = From});
+handle_call_({nexax,Serial,Channel,Level},From,Ctx) ->
+     command(nexax_command, [Serial, Channel, Level], Ctx#ctx {client = From});
+handle_call_({waveman,House,Channel,On},From,Ctx) ->
+    command(waveman_command, [House, Channel, On], Ctx#ctx {client = From});
+handle_call_({sartano,Channel,On},From,Ctx) ->
+    command(sartano_command,[Channel, On], Ctx#ctx {client = From});
+handle_call_({ikea,System,Channel,Level,Style},From,Ctx) ->
+    command(ikea_command, [System,Channel,Level,Style],Ctx#ctx{client = From});
+handle_call_({risingsun,Code,Unit,On},From,Ctx) ->
+    command(risingsun_command, [Code,Unit,On], Ctx#ctx {client = From});
+handle_call_({send_pulses,PulsData}, From, Ctx) ->
+    command_pulse_data(PulsData, Ctx#ctx { client = From });
+handle_call_(_Request, _From, Ctx) ->
     {reply, {error,bad_call}, Ctx}.
 
 
@@ -655,6 +657,8 @@ handle_info({timeout,TRef,reply}, Ctx=#ctx {reply_timer=TRef}) ->
     gen_server:reply(Ctx#ctx.client, {error, port_timeout}),
     Ctx1 = Ctx#ctx { reply_timer=undefined, client = undefined},
     next_command(Ctx1);
+handle_info({timeout,_TRef,next}, Ctx=#ctx {variant=net}) ->
+    next_command(Ctx);
 
 
 handle_info({timeout,Ref,reopen}, Ctx) when Ctx#ctx.reopen_timer =:= Ref ->
@@ -709,7 +713,7 @@ code_change(_OldVsn, Ctx, _Extra) ->
 next_command(Ctx) ->
     case queue:out(Ctx#ctx.queue) of
 	{{value,{call,Call,From}}, Q1} ->
-	    case handle_call(Call, From, Ctx#ctx { queue=Q1}) of
+	    case handle_call_(Call, From, Ctx#ctx { queue=Q1}) of
 		{reply,Reply,Ctx1} ->
 		    gen_server:reply(From,Reply),
 		    {noreply,Ctx1};
