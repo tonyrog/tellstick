@@ -1,12 +1,11 @@
 {application, tellstick,
  [
-  {description, ""},
-  {vsn, "1"},
+  {description, "native api to telldus stick/duo/net"},
+  {vsn, git},
   {registered, []},
   {applications, [
                   kernel,
                   stdlib
                  ]},
-  {mod, { tellstick_app, []}},
-  {env, []}
+  {mod, { tellstick_app, []}}
  ]}.
