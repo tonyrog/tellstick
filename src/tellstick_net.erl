@@ -96,20 +96,17 @@ open(Ip) ->
 close(#tsock{socket=U}) ->
     gen_udp:close(U).
 
+%% raw send data in udp datagram
 send(#tsock{socket=U,ip=Ip,port=Port}, Data) ->
     gen_udp:send(U, Ip, Port, Data).
-
-
-%% disconnect and reset the tellstick-net
-disconnect(TSock) ->
-    send(TSock, encode(disconnect)).
 
 reglistener(TSock) ->
     send(TSock,encode(reglistener)).
 
+%% (the order is fixed!)
 %% {struct, [
-%%     {"P",Pause}     (default 11)
-%%     {"R",Repeats}   (default 10)
+%%     {"P",Pause}     (optional - default 11)
+%%     {"R",Repeats}   (optional - default 10)
 %%     {"S", Data}
 %% }
 %%
@@ -117,8 +114,8 @@ send_items(TSock, Items) ->
     send(TSock, [encode(send),encode({struct,Items})]).
 
 %% {struct, [
-%%     {"P",Pause}     (default 11)
-%%     {"R",Repeats}   (default 10)
+%%     {"P",Pause}     (optional - default 11)
+%%     {"R",Repeats}   (optional - default 10)
 %%     {"protocol","arctech"}, {"model","selflearning"}, 
 %%         {"house", H}, {"unit", U}, {"method", M}
 %% }
@@ -133,6 +130,39 @@ send_archtech(TSock, House, Unit, Value) ->
 
 send_pulses(TSock, Data) ->
     send_items(TSock, [{"S",Data}]).
+
+
+%% set temporary ip params (Addr={255,255,255,255} => DHCP enabled)
+
+setip(TSock,Addr,NetMask,Gateway,Dns1,Dns2) ->
+    send(TSock, [encode(setip),
+		 encode({struct,
+			 [
+			  {ip,ip4_value(Addr)},
+			  {netmask,ip4_value(NetMask)},
+			  {gateway,ip4_value(Gateway)},
+			  {dns1,ip4_value(Dns1)},
+			  {dns2,ip4_value(Dns2)}
+			 ]})]).
+
+setip_dhcp(TSock) ->
+    A = {255,255,255,255},
+    setip(TSock, A, A, A, A, A).
+
+saveip(TSock) ->
+    send(TSock, encode(saveip)).
+
+%% disconnect and reset the tellstick-net
+disconnect(TSock) ->
+    send(TSock, encode(disconnect)).
+
+%% convert ipv4 tuple into uint32 value    
+ip4_value({255,255,255,255}) ->
+    16#ffffffff;
+ip4_value({A,B,C,D}) -> 
+    (A bsl 24) + (B bsl 16) + (C bsl 8) + D;
+ip4_value(A) when is_integer(A), A>=0, A =< 16#ffffffff ->
+    A.
 
 %%
 %% detect tellsticks on the local net
