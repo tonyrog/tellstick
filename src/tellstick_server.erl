@@ -16,7 +16,7 @@
 %%%---- END COPYRIGHT ----------------------------------------------------------
 %%%-------------------------------------------------------------------
 %%% @author Tony Rogvall <tony@rogvall.se>
-%%% @author Malotte Westman Lönne <malotte@malotte.net>
+%%% @author Malotte Westman Lonne <malotte@malotte.net>
 %%% @copyright (C) 2014, Tony Rogvall
 %%% @doc
 %%%     TELLSTICK driver.
@@ -381,7 +381,7 @@ open(Ctx=#ctx { variant = net, device = Code, reopen_ival = Reopen_ival }) ->
 	Error ->
 	    Error
     end;
-open(Ctx=#ctx { variant = simulated, device = ""}) ->
+open(Ctx=#ctx { variant = simulated }) ->
     lager:debug("TELLSTICK open: simulated\n", []),
     {ok, Ctx#ctx { handle=simulated, version="0" }};
 
