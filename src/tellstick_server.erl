@@ -28,8 +28,6 @@
 
 -behaviour(gen_server).
 
--include_lib("lager/include/log.hrl").
-
 %% API
 -export([start_link/1, 
 	 stop/0,
